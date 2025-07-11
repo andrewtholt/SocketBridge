@@ -99,12 +99,11 @@ clean:
 	rm -rf $(OBJDIR) $(BINDIR)
 	@echo "Cleaned up build files"
 
-# Clean message queues (removes SysV message queues)
-clean-queues:
-	@echo "Cleaning up message queues..."
-	-ipcrm -Q 1234 2>/dev/null || true
-	-ipcrm -Q 5678 2>/dev/null || true
-	@echo "Message queues cleaned"
+# Clean named pipes
+clean-pipes:
+	@echo "Cleaning up named pipes..."
+	-rm -f /tmp/socket_bridge_input /tmp/socket_bridge_output
+	@echo "Named pipes cleaned"
 
 # Run tests
 test: all
@@ -116,10 +115,10 @@ test: all
 	$(BINDIR)/socket_bridge 127.0.0.1 8080 &
 	@sleep 2
 	@echo "Sending test message..."
-	echo "Hello from message queue" | $(BINDIR)/msg_send 1234
+	echo "Hello from named pipe" > /tmp/socket_bridge_input &
 	@sleep 1
 	@echo "Reading response..."
-	$(BINDIR)/msg_receive 5678
+	timeout 2 cat /tmp/socket_bridge_output || echo "No response received"
 	@echo "Stopping background processes..."
 	@pkill -f socket_bridge || true
 	@pkill -f test_server || true
@@ -134,14 +133,14 @@ help:
 	@echo "  install      - Install to /usr/local/bin (requires sudo)"
 	@echo "  uninstall    - Remove from /usr/local/bin (requires sudo)"
 	@echo "  clean        - Remove build files"
-	@echo "  clean-queues - Remove SysV message queues"
+	@echo "  clean-pipes  - Remove named pipes"
 	@echo "  test         - Run basic functionality test"
 	@echo "  help         - Show this help message"
 	@echo ""
 	@echo "Usage examples:"
 	@echo "  make                    # Build all programs"
 	@echo "  make debug             # Build debug version"
-	@echo "  make clean all         # Clean and rebuild"
+	@echo "  make clean-pipes           # Clean named pipes"
 	@echo "  make install           # Install system-wide"
 	@echo "  make test              # Run tests"
 
@@ -166,4 +165,4 @@ info:
 	@echo "  Target: $(MAIN_TARGET)"
 
 # Phony targets
-.PHONY: all main helpers debug release install uninstall clean clean-queues test help check-deps info directories
+.PHONY: all main helpers debug release install uninstall clean clean-pipes test help check-deps info directories

@@ -4,38 +4,32 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
-#include <sys/msg.h>
-#include <sys/ipc.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
 #include <time.h>
+#include <fcntl.h>
 
 #define MAX_MSG_SIZE 1024
-#define INPUT_QUEUE_KEY 1234
-#define OUTPUT_QUEUE_KEY 5678
-
-// Message structure for SysV message queues
-struct msg_buffer {
-    long msg_type;
-    char msg_text[MAX_MSG_SIZE];
-};
+#define INPUT_PIPE_NAME "/tmp/socket_bridge_input"
+#define OUTPUT_PIPE_NAME "/tmp/socket_bridge_output"
 
 // Global variables
 int sockfd = -1;
-int input_msgid = -1;
-int output_msgid = -1;
+int input_pipe_fd = -1;
+int output_pipe_fd = -1;
 volatile int running = 1;
 
 // Function prototypes
 void cleanup(void);
 void signal_handler(int sig);
 void* socket_reader_thread(void* arg);
-void* msgq_reader_thread(void* arg);
+void* pipe_reader_thread(void* arg);
 int setup_socket(const char* server_ip, int port);
-int setup_message_queues(void);
+int setup_named_pipes(void);
 
 int main(int argc, char* argv[]) {
     if (argc != 3) {
@@ -53,9 +47,9 @@ int main(int argc, char* argv[]) {
     // Setup cleanup function
     atexit(cleanup);
 
-    // Setup message queues
-    if (setup_message_queues() != 0) {
-        fprintf(stderr, "Failed to setup message queues\n");
+    // Setup named pipes
+    if (setup_named_pipes() != 0) {
+        fprintf(stderr, "Failed to setup named pipes\n");
         exit(EXIT_FAILURE);
     }
 
@@ -66,25 +60,25 @@ int main(int argc, char* argv[]) {
     }
 
     printf("Connected to server %s:%d\n", server_ip, port);
-    printf("Input message queue ID: %d\n", input_msgid);
-    printf("Output message queue ID: %d\n", output_msgid);
+    printf("Input pipe: %s\n", INPUT_PIPE_NAME);
+    printf("Output pipe: %s\n", OUTPUT_PIPE_NAME);
 
     // Create threads
-    pthread_t socket_thread, msgq_thread;
+    pthread_t socket_thread, pipe_thread;
     
     if (pthread_create(&socket_thread, NULL, socket_reader_thread, NULL) != 0) {
         perror("Failed to create socket reader thread");
         exit(EXIT_FAILURE);
     }
 
-    if (pthread_create(&msgq_thread, NULL, msgq_reader_thread, NULL) != 0) {
-        perror("Failed to create message queue reader thread");
+    if (pthread_create(&pipe_thread, NULL, pipe_reader_thread, NULL) != 0) {
+        perror("Failed to create pipe reader thread");
         exit(EXIT_FAILURE);
     }
 
     // Wait for threads to complete
     pthread_join(socket_thread, NULL);
-    pthread_join(msgq_thread, NULL);
+    pthread_join(pipe_thread, NULL);
 
     return 0;
 }
@@ -118,18 +112,34 @@ int setup_socket(const char* server_ip, int port) {
     return 0;
 }
 
-int setup_message_queues(void) {
-    // Create or get input message queue
-    input_msgid = msgget(INPUT_QUEUE_KEY, IPC_CREAT | 0666);
-    if (input_msgid == -1) {
-        perror("Input message queue creation failed");
+int setup_named_pipes(void) {
+    // Create input pipe (for reading data to send to server)
+    if (mkfifo(INPUT_PIPE_NAME, 0666) == -1) {
+        if (errno != EEXIST) {
+            perror("Failed to create input pipe");
+            return -1;
+        }
+    }
+
+    // Create output pipe (for writing data received from server)
+    if (mkfifo(OUTPUT_PIPE_NAME, 0666) == -1) {
+        if (errno != EEXIST) {
+            perror("Failed to create output pipe");
+            return -1;
+        }
+    }
+
+    // Open input pipe for reading (non-blocking)
+    input_pipe_fd = open(INPUT_PIPE_NAME, O_RDONLY | O_NONBLOCK);
+    if (input_pipe_fd == -1) {
+        perror("Failed to open input pipe");
         return -1;
     }
 
-    // Create or get output message queue
-    output_msgid = msgget(OUTPUT_QUEUE_KEY, IPC_CREAT | 0666);
-    if (output_msgid == -1) {
-        perror("Output message queue creation failed");
+    // Open output pipe for writing
+    output_pipe_fd = open(OUTPUT_PIPE_NAME, O_WRONLY);
+    if (output_pipe_fd == -1) {
+        perror("Failed to open output pipe");
         return -1;
     }
 
@@ -138,9 +148,8 @@ int setup_message_queues(void) {
 
 void* socket_reader_thread(void* arg) {
     (void)arg; // Suppress unused parameter warning
-    struct msg_buffer msg;
     char buffer[MAX_MSG_SIZE];
-    ssize_t bytes_received;
+    ssize_t bytes_received, bytes_written;
 
     while (running) {
         // Read from socket
@@ -159,45 +168,51 @@ void* socket_reader_thread(void* arg) {
         // Null-terminate the received data
         buffer[bytes_received] = '\0';
 
-        // Prepare message for output queue
-        msg.msg_type = 1;
-        strncpy(msg.msg_text, buffer, MAX_MSG_SIZE - 1);
-        msg.msg_text[MAX_MSG_SIZE - 1] = '\0';
-
-        // Send to output message queue
-        if (msgsnd(output_msgid, &msg, strlen(msg.msg_text) + 1, IPC_NOWAIT) == -1) {
-            if (errno != EAGAIN) {
-                perror("Failed to send message to output queue");
-            }
+        // Write to output pipe
+        bytes_written = write(output_pipe_fd, buffer, bytes_received);
+        
+        if (bytes_written == -1) {
+            perror("Failed to write to output pipe");
         } else {
-            printf("Received from server and sent to output queue: %s\n", msg.msg_text);
+            printf("Received from server and wrote to output pipe: %.*s\n", 
+                   (int)bytes_received, buffer);
         }
     }
 
     return NULL;
 }
 
-void* msgq_reader_thread(void* arg) {
+void* pipe_reader_thread(void* arg) {
     (void)arg; // Suppress unused parameter warning
-    struct msg_buffer msg;
-    ssize_t bytes_sent;
+    char buffer[MAX_MSG_SIZE];
+    ssize_t bytes_read, bytes_sent;
 
     while (running) {
-        // Read from input message queue
-        if (msgrcv(input_msgid, &msg, MAX_MSG_SIZE, 0, IPC_NOWAIT) == -1) {
-            if (errno == ENOMSG) {
-                // No message available, sleep briefly
+        // Read from input pipe
+        bytes_read = read(input_pipe_fd, buffer, sizeof(buffer) - 1);
+        
+        if (bytes_read == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // No data available, sleep briefly
                 struct timespec ts = {0, 100000000}; // 100ms
                 nanosleep(&ts, NULL);
                 continue;
             } else {
-                perror("Failed to receive message from input queue");
+                perror("Failed to read from input pipe");
                 break;
             }
+        } else if (bytes_read == 0) {
+            // EOF - pipe was closed and reopened, or no writers
+            struct timespec ts = {0, 100000000}; // 100ms
+            nanosleep(&ts, NULL);
+            continue;
         }
 
+        // Null-terminate the data
+        buffer[bytes_read] = '\0';
+
         // Send to socket
-        bytes_sent = send(sockfd, msg.msg_text, strlen(msg.msg_text), 0);
+        bytes_sent = send(sockfd, buffer, bytes_read, 0);
         
         if (bytes_sent == -1) {
             perror("Socket send error");
@@ -205,7 +220,8 @@ void* msgq_reader_thread(void* arg) {
             break;
         }
 
-        printf("Received from input queue and sent to server: %s\n", msg.msg_text);
+        printf("Read from input pipe and sent to server: %.*s\n", 
+               (int)bytes_read, buffer);
     }
 
     return NULL;
@@ -224,9 +240,18 @@ void cleanup(void) {
         close(sockfd);
     }
 
-    // Note: We don't automatically remove message queues as they might be used by other processes
-    // To manually remove them, use: ipcrm -q <msgid>
-    // Or use msgctl(msgid, IPC_RMID, NULL) if you want to remove them programmatically
+    // Close pipe file descriptors
+    if (input_pipe_fd != -1) {
+        close(input_pipe_fd);
+    }
+    
+    if (output_pipe_fd != -1) {
+        close(output_pipe_fd);
+    }
+
+    // Remove named pipes
+    unlink(INPUT_PIPE_NAME);
+    unlink(OUTPUT_PIPE_NAME);
     
     printf("Cleanup complete\n");
 }
