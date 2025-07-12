@@ -11,7 +11,7 @@ This can be useful for debugging network applications, piping network traffic to
 
 Connects to a specified remote host and port.
 
-Reads data from the network socket and writes it to a named pipe (/tmp/net\_to\_pipe).
+Reads data from the network socket and writes it to a named pipe (/tmp/net_to_pipe).
 
 Reads data from another named pipe (/tmp/pipe\_to\_net) and sends it to the network socket.
 
@@ -46,13 +46,13 @@ make clean
 ```
 ## Usage
 
-./netpipe\_forwarder \[OPTIONS\]
+./netpipe_forwarder [OPTIONS]
 Options:
 \--help: Display the help message and exit.
 
-\-h \<address\>: Specify the address of the port to connect to (e.g., localhost, 127.0.0.1, example.com). This option is required.
+\-h <address>: Specify the address of the port to connect to (e.g., localhost, 127.0.0.1, example.com). This option is required.
 
-\-p \<port\>: Specify the port number to connect to (e.g., 80, 22, 12345). This option is required.
+\-p <port>: Specify the port number to connect to (e.g., 80, 22, 12345). This option is required.
 
 \-v: Enable verbose output for debugging.
 
@@ -79,11 +79,11 @@ nc -l -p 12345
 
 This netcat instance will listen on port 12345\. Anything you type here will be sent to connected clients, and anything received from clients will be displayed here.
 
-Run the netpipe\_forwarder (in Terminal 2):
+Run the netpipe_forwarder (in Terminal 2):
 Connect your forwarder to the netcat server:
 
 ```bash
-./netpipe\_forwarder -h 127.0.0.1 -p 12345 -v
+./netpipe_forwarder -h 127.0.0.1 -p 12345 -v
 ```
 
 You will see verbose output indicating the connection and thread creation.
@@ -97,7 +97,7 @@ In, yet another terminal widow, do the following:
 If you now tipe into this window the text will be sent, via netpipe_forwarder, to the socket of the application.  Anything it returns will be displayed on the screen.
 
 Sending data from a named pipe to the network (Terminal 3):
-Write some text to the /tmp/pipe\_to\_net named pipe. This data will be sent to your netcat server.
+Write some text to the /tmp/pipe_to_net named pipe. This data will be sent to your netcat server.
 
 To end the session type:
 
