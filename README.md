@@ -101,4 +101,11 @@ If you now tipe into this window the text will be sent, via netpipe_forwarder, t
 Sending data from a named pipe to the network (Terminal 3):
 Write some text to the /tmp/pipe\_to\_net named pipe. This data will be sent to your netcat server.
 
+To end the session type:
+
+```bash
+^quit
+```
+
+
 
