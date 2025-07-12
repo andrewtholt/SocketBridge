@@ -30,10 +30,8 @@ Build Instructions
 Save the source code:
 Save the provided C code as netpipe\_forwarder.c in a directory.
 
-###Save the Makefile:
-Save the provided Makefile content as Makefile (no file extension) in the same directory as netpipe\_forwarder.c.
 
-###Compile the program:
+## Compile the program:
 Open a terminal, navigate to the directory where you saved the files, and run:
 
 make
@@ -46,7 +44,7 @@ To remove the generated object files and the executable, run:
 ```bash
 make clean
 ```
-###Usage
+## Usage
 
 ./netpipe\_forwarder \[OPTIONS\]
 Options:
