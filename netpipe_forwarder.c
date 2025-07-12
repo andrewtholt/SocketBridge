@@ -1,5 +1,3 @@
-
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,19 +10,27 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h> // For signal handling
 
 #define BUFFER_SIZE 4096
-#define PIPE_READ_NAME "/tmp/net_to_pipe"
-#define PIPE_WRITE_NAME "/tmp/pipe_to_net"
+#define PIPE_NET_TO_APP_NAME "/tmp/net_to_pipe"  // Data from network (socket) to application (written by forwarder, read by external tools)
+#define PIPE_APP_TO_NET_NAME "/tmp/pipe_to_net" // Data from application (external tools) to network (written by external tools, read by forwarder)
+
+// Reconnection settings
+#define RECONNECT_DELAY_SECONDS 5
+#define MAX_RECONNECT_ATTEMPTS 0 // 0 for infinite attempts
+
+// Global flag to signal threads to stop
+volatile int keep_running = 1;
 
 typedef struct {
-    int socket_fd;
-    int pipe_read_fd;  // Pipe to read from for sending to socket
-    int pipe_write_fd; // Pipe to write to from socket
+    int *socket_fd_ptr;       // Pointer to the socket_fd in main
+    int *pipe_app_to_net_fd_ptr; // Pointer to pipe_read_fd (from app to net) in main
+    int *pipe_net_to_app_fd_ptr; // Pointer to pipe_write_fd (from net to app) in main
     int verbose;
 } thread_data_t;
 
-void error(const char *msg) {
+void error_exit(const char *msg) {
     perror(msg);
     exit(EXIT_FAILURE);
 }
@@ -32,7 +38,8 @@ void error(const char *msg) {
 void print_usage() {
     fprintf(stderr, "Usage: your_program_name [OPTIONS]\n\n");
     fprintf(stderr, "This program connects to a network socket, reads data from it and writes to a named pipe,\n");
-    fprintf(stderr, "and simultaneously reads from another named pipe and writes to the same socket.\n\n");
+    fprintf(stderr, "and simultaneously reads from another named pipe and writes to the same socket.\n");
+    fprintf(stderr, "It attempts to automatically reconnect to both the network and named pipes if connections are lost.\n\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  --help        Display this help message and exit.\n");
     fprintf(stderr, "  -h <address>  Specify the address of the port to connect to (e.g., localhost, 127.0.0.1).\n");
@@ -40,96 +47,208 @@ void print_usage() {
     fprintf(stderr, "  -v            Enable verbose output for debugging.\n");
 }
 
-// Thread function to read from socket and write to named pipe
+// Signal handler for graceful shutdown (e.g., Ctrl+C)
+void sigint_handler(int signum) {
+    fprintf(stderr, "\nSIGINT (%d) received. Shutting down...\n",signum);
+    keep_running = 0;
+}
+
+// Thread function to read from socket and write to named pipe (net -> app)
 void *socket_to_pipe_thread(void *arg) {
     thread_data_t *data = (thread_data_t *)arg;
     char buffer[BUFFER_SIZE];
     ssize_t bytes_received;
 
     if (data->verbose) {
-        printf("[Thread 1] Starting socket_to_pipe_thread...\n");
+        printf("[SocketToPipeThread] Starting...\n");
     }
 
-    while ((bytes_received = recv(data->socket_fd, buffer, sizeof(buffer), 0)) > 0) {
-        if (data->verbose) {
-            printf("[Thread 1] Received %zd bytes from socket. Writing to named pipe '%s'.\n", bytes_received, PIPE_READ_NAME);
-            // Optionally print content, but be careful with non-printable characters
-            // for (ssize_t i = 0; i < bytes_received; ++i) {
-            //     printf("%02x ", (unsigned char)buffer[i]);
-            // }
-            // printf("\n");
-        }
-        if (write(data->pipe_write_fd, buffer, bytes_received) == -1) {
-            perror("[Thread 1] Error writing to named pipe");
-            break;
-        }
-    }
+    while (keep_running) {
+        int current_socket_fd = *(data->socket_fd_ptr);
+        int current_pipe_fd = *(data->pipe_net_to_app_fd_ptr);
 
-    if (bytes_received == 0) {
-        if (data->verbose) {
-            printf("[Thread 1] Socket closed by peer.\n");
+        // Wait for both socket and pipe to be valid
+        if (current_socket_fd == -1 || current_pipe_fd == -1) {
+            usleep(100000); // 100 ms
+            continue;
         }
-    } else if (bytes_received == -1) {
-        perror("[Thread 1] Error receiving from socket");
+
+        bytes_received = recv(current_socket_fd, buffer, sizeof(buffer), 0);
+
+        if (bytes_received > 0) {
+            if (data->verbose) {
+                printf("[SocketToPipeThread] Received %zd bytes from socket. Writing to named pipe '%s'.\n", bytes_received, PIPE_NET_TO_APP_NAME);
+            }
+            if (write(current_pipe_fd, buffer, bytes_received) == -1) {
+                if (errno == EPIPE) { // No process has the pipe open for reading
+                    if (data->verbose) printf("[SocketToPipeThread] Named pipe '%s' has no reader (EPIPE). Signalling main to reopen pipe.\n", PIPE_NET_TO_APP_NAME);
+                    *(data->pipe_net_to_app_fd_ptr) = -1; // Invalidate pipe FD to trigger reopen
+                } else {
+                    perror("[SocketToPipeThread] Error writing to named pipe");
+                }
+                // Even if pipe write fails, try to keep reading from socket for now
+            }
+        } else if (bytes_received == 0) {
+            // Peer has performed an orderly shutdown
+            if (data->verbose) {
+                printf("[SocketToPipeThread] Socket closed by peer. Signalling main for reconnection.\n");
+            }
+            *(data->socket_fd_ptr) = -1; // Invalidate socket to trigger reconnection
+            // Wait for main thread to re-establish
+            while(*(data->socket_fd_ptr) == -1 && keep_running) {
+                usleep(100000);
+            }
+        } else if (bytes_received == -1) {
+            // An error occurred (e.g., connection reset by peer, socket broken)
+            if (errno == EBADF || errno == ENOTSOCK) {
+                if (data->verbose) printf("[SocketToPipeThread] Socket descriptor invalid, likely being reconnected.\n");
+            } else {
+                perror("[SocketToPipeThread] Error receiving from socket");
+            }
+            *(data->socket_fd_ptr) = -1; // Invalidate socket to trigger reconnection
+            // Wait for main thread to re-establish
+            while(*(data->socket_fd_ptr) == -1 && keep_running) {
+                usleep(100000);
+            }
+        }
     }
 
     if (data->verbose) {
-        printf("[Thread 1] socket_to_pipe_thread exiting.\n");
+        printf("[SocketToPipeThread] Exiting.\n");
     }
     return NULL;
 }
 
-// Thread function to read from named pipe and write to socket
+// Thread function to read from named pipe and write to socket (app -> net)
 void *pipe_to_socket_thread(void *arg) {
     thread_data_t *data = (thread_data_t *)arg;
     char buffer[BUFFER_SIZE];
     ssize_t bytes_read;
+    int original_flags;
 
     if (data->verbose) {
-        printf("[Thread 2] Starting pipe_to_socket_thread...\n");
+        printf("[PipeToSocketThread] Starting...\n");
     }
 
-    while ((bytes_read = read(data->pipe_read_fd, buffer, sizeof(buffer))) > 0) {
-        if (data->verbose) {
-            printf("[Thread 2] Read %zd bytes from named pipe '%s'. Writing to socket.\n", bytes_read, PIPE_WRITE_NAME);
-            // Optionally print content
-            // for (ssize_t i = 0; i < bytes_read; ++i) {
-            //     printf("%02x ", (unsigned char)buffer[i]);
-            // }
-            // printf("\n");
-        }
-        if (send(data->socket_fd, buffer, bytes_read, 0) == -1) {
-            perror("[Thread 2] Error sending to socket");
-            break;
-        }
-    }
+    while (keep_running) {
+        int current_socket_fd = *(data->socket_fd_ptr);
+        int current_pipe_fd = *(data->pipe_app_to_net_fd_ptr);
 
-    if (bytes_read == 0) {
-        if (data->verbose) {
-            printf("[Thread 2] Named pipe '%s' closed.\n", PIPE_WRITE_NAME);
+        // Wait for both socket and pipe to be valid
+        if (current_socket_fd == -1 || current_pipe_fd == -1) {
+            usleep(100000); // 100 ms
+            continue;
         }
-    } else if (bytes_read == -1) {
-        perror("[Thread 2] Error reading from named pipe");
+
+        // Set pipe to non-blocking temporarily for this read
+        original_flags = fcntl(current_pipe_fd, F_GETFL, 0);
+        fcntl(current_pipe_fd, F_SETFL, original_flags | O_NONBLOCK);
+
+        bytes_read = read(current_pipe_fd, buffer, sizeof(buffer));
+
+        // Restore blocking mode (if it was blocking before)
+        fcntl(current_pipe_fd, F_SETFL, original_flags);
+
+        if (bytes_read > 0) {
+            if (data->verbose) {
+                printf("[PipeToSocketThread] Read %zd bytes from named pipe '%s'. Writing to socket.\n", bytes_read, PIPE_APP_TO_NET_NAME);
+            }
+            if (send(current_socket_fd, buffer, bytes_read, 0) == -1) {
+                perror("[PipeToSocketThread] Error sending to socket");
+                *(data->socket_fd_ptr) = -1; // Invalidate socket to trigger reconnection
+                // Wait for main thread to re-establish
+                while(*(data->socket_fd_ptr) == -1 && keep_running) {
+                    usleep(100000);
+                }
+            }
+        } else if (bytes_read == 0) {
+            // EOF on pipe: The writer end of the FIFO was closed.
+            if (data->verbose) {
+                printf("[PipeToSocketThread] Named pipe '%s' writer closed (EOF). Signalling main to reopen pipe.\n", PIPE_APP_TO_NET_NAME);
+            }
+            *(data->pipe_app_to_net_fd_ptr) = -1; // Invalidate pipe FD to trigger reopen
+            // Wait for main thread to re-establish
+            while(*(data->pipe_app_to_net_fd_ptr) == -1 && keep_running) {
+                usleep(100000);
+            }
+        } else if (bytes_read == -1) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) { // EAGAIN/EWOULDBLOCK for non-blocking read
+                perror("[PipeToSocketThread] Error reading from named pipe");
+                // Potentially a more serious pipe error, signal main to reopen
+                *(data->pipe_app_to_net_fd_ptr) = -1;
+                 while(*(data->pipe_app_to_net_fd_ptr) == -1 && keep_running) {
+                    usleep(100000);
+                }
+            }
+            usleep(100000); // Prevent busy-waiting if no data
+        }
     }
 
     if (data->verbose) {
-        printf("[Thread 2] pipe_to_socket_thread exiting.\n");
+        printf("[PipeToSocketThread] Exiting.\n");
     }
     return NULL;
 }
 
+// Helper to open a FIFO, handling EEXIST and blocking until both sides are open
+int open_fifo_robustly(const char *fifo_name, int flags, int verbose) {
+    int fd = -1;
+    if (mkfifo(fifo_name, 0666) == -1 && errno != EEXIST) {
+        perror("mkfifo");
+        return -1;
+    } else if (verbose && errno == EEXIST) {
+        printf("Named pipe '%s' already exists.\n", fifo_name);
+    }
+
+    int attempts = 0;
+    const int max_attempts_open = 10; // Avoid infinite loop if something is truly wrong
+    while (keep_running && fd == -1) {
+        if (verbose) {
+            printf("Opening '%s' with flags %d...\n", fifo_name, flags);
+        }
+        fd = open(fifo_name, flags);
+        if (fd == -1) {
+            if (errno == ENXIO) { // No readers/writers yet
+                if (verbose) printf("Waiting for other end of pipe '%s' to open (ENXIO).\n", fifo_name);
+                sleep(1); // Wait a second before retrying
+                attempts++;
+                if (max_attempts_open > 0 && attempts >= max_attempts_open) {
+                    fprintf(stderr, "Max open attempts for pipe '%s' reached. Giving up.\n", fifo_name);
+                    return -1;
+                }
+            } else {
+                perror("open fifo_name");
+                sleep(1); // Other error, wait and retry
+                attempts++;
+                 if (max_attempts_open > 0 && attempts >= max_attempts_open) {
+                    fprintf(stderr, "Max open attempts for pipe '%s' reached. Giving up.\n", fifo_name);
+                    return -1;
+                }
+            }
+        } else {
+            if (verbose) printf("Successfully opened '%s'. FD: %d\n", fifo_name, fd);
+        }
+    }
+    return fd;
+}
+
+
 int main(int argc, char *argv[]) {
-    int socket_fd = -1;
-    int pipe_read_fd = -1;
-    int pipe_write_fd = -1;
+    int socket_fd = -1; // Initialize to -1 to indicate no connection
+    int pipe_app_to_net_fd = -1; // From app (external) to network (read by forwarder)
+    int pipe_net_to_app_fd = -1; // From network to app (written by forwarder)
     char *address = NULL;
     int port = -1;
     int verbose = 0;
     struct sockaddr_in serv_addr;
     pthread_t tid1, tid2;
     thread_data_t thread_data;
+    int reconnect_socket_attempts = 0;
 
-    // Parse command line arguments
+    // Register signal handler for graceful shutdown
+    signal(SIGINT, sigint_handler);
+
+    // Parse command line arguments (same as before)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0) {
             print_usage();
@@ -174,122 +293,139 @@ int main(int argc, char *argv[]) {
         printf("Configuring: Address=%s, Port=%d, Verbose=%d\n", address, port, verbose);
     }
 
-    // 1. Create named pipes (FIFOs)
-    if (verbose) {
-        printf("Creating named pipes...\n");
-    }
-
-    // Pipe for data from network to application
-    if (mkfifo(PIPE_READ_NAME, 0666) == -1) {
-        if (errno != EEXIST) { // If it exists, that's fine, just open it
-            error("mkfifo PIPE_READ_NAME");
-        } else {
-            if (verbose) printf("Named pipe '%s' already exists.\n", PIPE_READ_NAME);
-        }
-    }
-
-    // Pipe for data from application to network
-    if (mkfifo(PIPE_WRITE_NAME, 0666) == -1) {
-        if (errno != EEXIST) {
-            error("mkfifo PIPE_WRITE_NAME");
-        } else {
-            if (verbose) printf("Named pipe '%s' already exists.\n", PIPE_WRITE_NAME);
-        }
-    }
-
-    // 2. Create socket
-    if (verbose) {
-        printf("Creating socket...\n");
-    }
-    socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (socket_fd < 0) {
-        error("ERROR opening socket");
-    }
-
-    // 3. Connect to server
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, address, &serv_addr.sin_addr) <= 0) {
-        close(socket_fd);
-        error("Invalid address/ Address not supported");
-    }
-
-    if (verbose) {
-        printf("Connecting to %s:%d...\n", address, port);
-    }
-    if (connect(socket_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        close(socket_fd);
-        error("ERROR connecting");
-    }
-    if (verbose) {
-        printf("Successfully connected to %s:%d.\n", address, port);
-    }
-
-    // Open named pipes
-    // Open PIPE_READ_NAME for writing (data from socket -> pipe)
-    if (verbose) {
-        printf("Opening named pipe '%s' for writing (socket to pipe)...\n", PIPE_READ_NAME);
-    }
-    pipe_write_fd = open(PIPE_READ_NAME, O_WRONLY);
-    if (pipe_write_fd < 0) {
-        close(socket_fd);
-        error("ERROR opening PIPE_READ_NAME for writing");
-    }
-    if (verbose) {
-        printf("Named pipe '%s' opened for writing.\n", PIPE_READ_NAME);
-    }
-
-    // Open PIPE_WRITE_NAME for reading (data from pipe -> socket)
-    if (verbose) {
-        printf("Opening named pipe '%s' for reading (pipe to socket)...\n", PIPE_WRITE_NAME);
-    }
-    pipe_read_fd = open(PIPE_WRITE_NAME, O_RDONLY);
-    if (pipe_read_fd < 0) {
-        close(pipe_write_fd);
-        close(socket_fd);
-        error("ERROR opening PIPE_WRITE_NAME for reading");
-    }
-    if (verbose) {
-        printf("Named pipe '%s' opened for reading.\n", PIPE_WRITE_NAME);
-    }
-
-    // Prepare thread data
-    thread_data.socket_fd = socket_fd;
-    thread_data.pipe_read_fd = pipe_read_fd;
-    thread_data.pipe_write_fd = pipe_write_fd;
+    // Prepare thread data - pass pointers to main's FDs
+    thread_data.socket_fd_ptr = &socket_fd;
+    thread_data.pipe_app_to_net_fd_ptr = &pipe_app_to_net_fd;
+    thread_data.pipe_net_to_app_fd_ptr = &pipe_net_to_app_fd;
     thread_data.verbose = verbose;
 
-    // Create threads
+    // Create threads (they will continuously check the FD pointers)
     if (verbose) {
-        printf("Creating threads...\n");
+        printf("Creating communication threads...\n");
     }
     if (pthread_create(&tid1, NULL, socket_to_pipe_thread, (void *)&thread_data) != 0) {
-        error("Error creating socket_to_pipe_thread");
+        error_exit("Error creating socket_to_pipe_thread");
     }
     if (pthread_create(&tid2, NULL, pipe_to_socket_thread, (void *)&thread_data) != 0) {
-        error("Error creating pipe_to_socket_thread");
+        error_exit("Error creating pipe_to_socket_thread");
     }
 
-    // Wait for threads to finish (they will typically run until socket/pipe closure)
+    // Main loop for connection management (socket and pipes)
+    while (keep_running) {
+        // --- Manage Socket Connection ---
+        if (socket_fd == -1) {
+            if (reconnect_socket_attempts > 0) {
+                if (verbose) {
+                    printf("Socket connection lost. Attempting reconnect in %d seconds...\n", RECONNECT_DELAY_SECONDS);
+                }
+                sleep(RECONNECT_DELAY_SECONDS);
+            }
+
+            if (!keep_running) break;
+
+            if (MAX_RECONNECT_ATTEMPTS > 0 && reconnect_socket_attempts >= MAX_RECONNECT_ATTEMPTS) {
+                fprintf(stderr, "Maximum socket reconnect attempts (%d) reached. Exiting.\n", MAX_RECONNECT_ATTEMPTS);
+                keep_running = 0;
+                break;
+            }
+
+            if (verbose) {
+                printf("Attempting to connect to %s:%d (Attempt %d)...\n", address, port, reconnect_socket_attempts + 1);
+            }
+
+            if (socket_fd != -1) { // Close if it was left open from a previous attempt
+                close(socket_fd);
+                socket_fd = -1;
+            }
+
+            socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (socket_fd < 0) {
+                perror("ERROR creating socket for reconnection");
+                reconnect_socket_attempts++;
+                continue;
+            }
+
+            memset(&serv_addr, 0, sizeof(serv_addr));
+            serv_addr.sin_family = AF_INET;
+            serv_addr.sin_port = htons(port);
+            if (inet_pton(AF_INET, address, &serv_addr.sin_addr) <= 0) {
+                close(socket_fd);
+                socket_fd = -1;
+                fprintf(stderr, "Invalid address/ Address not supported for reconnection.\n");
+                reconnect_socket_attempts++;
+                continue;
+            }
+
+            if (connect(socket_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+                perror("ERROR connecting");
+                close(socket_fd);
+                socket_fd = -1;
+                reconnect_socket_attempts++;
+                continue;
+            }
+
+            if (verbose) {
+                printf("Successfully reconnected to %s:%d.\n", address, port);
+            }
+            reconnect_socket_attempts = 0;
+        }
+
+        // --- Manage Pipe Connections ---
+        // Pipe: Network to Application (Forwarder writes, external client reads)
+        if (pipe_net_to_app_fd == -1) {
+            if (pipe_net_to_app_fd != -1) { close(pipe_net_to_app_fd); } // Ensure closed
+            pipe_net_to_app_fd = open_fifo_robustly(PIPE_NET_TO_APP_NAME, O_WRONLY, verbose);
+            if (pipe_net_to_app_fd == -1) {
+                fprintf(stderr, "Failed to open FIFO for network to application (%s). Retrying...\n", PIPE_NET_TO_APP_NAME);
+                usleep(500000); // Wait before next retry
+                continue; // Loop again immediately to try both pipe and socket if needed
+            }
+        }
+
+        // Pipe: Application to Network (External client writes, forwarder reads)
+        if (pipe_app_to_net_fd == -1) {
+            if (pipe_app_to_net_fd != -1) { close(pipe_app_to_net_fd); } // Ensure closed
+            pipe_app_to_net_fd = open_fifo_robustly(PIPE_APP_TO_NET_NAME, O_RDONLY, verbose);
+            if (pipe_app_to_net_fd == -1) {
+                fprintf(stderr, "Failed to open FIFO for application to network (%s). Retrying...\n", PIPE_APP_TO_NET_NAME);
+                usleep(500000); // Wait before next retry
+                continue; // Loop again immediately to try both pipe and socket if needed
+            }
+        }
+
+        // If both socket and pipes are valid, main thread sleeps briefly
+        if (socket_fd != -1 && pipe_app_to_net_fd != -1 && pipe_net_to_app_fd != -1) {
+            usleep(500000); // 500 ms to avoid busy-waiting
+        } else {
+             usleep(100000); // Shorter sleep if still waiting for connections
+        }
+    }
+
+    // Signal threads to stop and wait for them
+    keep_running = 0; // Ensure threads see the stop signal
     if (verbose) {
-        printf("Waiting for threads to finish...\n");
+        printf("Main thread: Signalling threads to stop and waiting...\n");
     }
     pthread_join(tid1, NULL);
     pthread_join(tid2, NULL);
 
     // Cleanup
     if (verbose) {
-        printf("Cleaning up resources...\n");
+        printf("Main thread: Cleaning up resources...\n");
     }
-    close(socket_fd);
-    close(pipe_read_fd);
-    close(pipe_write_fd);
+    if (socket_fd != -1) {
+        close(socket_fd);
+    }
+    if (pipe_app_to_net_fd != -1) {
+        close(pipe_app_to_net_fd);
+    }
+    if (pipe_net_to_app_fd != -1) {
+        close(pipe_net_to_app_fd);
+    }
 
-    // Unlink named pipes - optional, but good for cleanup in long-running processes
-    // comment out if you want to keep the pipes for external interaction
-    unlink(PIPE_READ_NAME);
-    unlink(PIPE_WRITE_NAME);
+    // Unlink named pipes
+    unlink(PIPE_NET_TO_APP_NAME);
+    unlink(PIPE_APP_TO_NET_NAME);
 
     if (verbose) {
         printf("Program finished.\n");
