@@ -46,7 +46,6 @@ $100 constant /line
 : finish
 	fd-in close-file abort" Close In."
 	fd-out close-file abort" Close Out."
-	drop
 ;
 
 : tst
