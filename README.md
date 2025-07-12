@@ -106,5 +106,3 @@ To end the session type:
 ^quit
 ```
 
-
-
