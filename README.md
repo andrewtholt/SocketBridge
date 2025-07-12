@@ -30,16 +30,14 @@ Build Instructions
 Save the source code:
 Save the provided C code as netpipe\_forwarder.c in a directory.
 
-Save the Makefile:
+###Save the Makefile:
 Save the provided Makefile content as Makefile (no file extension) in the same directory as netpipe\_forwarder.c.
 
-Compile the program:
+###Compile the program:
 Open a terminal, navigate to the directory where you saved the files, and run:
 
-```bash
-
 make
-```
+
 This will compile the source code and create an executable named netpipe\_forwarder.
 
 Clean (Optional):
@@ -47,12 +45,9 @@ To remove the generated object files and the executable, run:
 
 ```bash
 make clean
-Usage
-Bash
-make clean
 ```
+###Usage
 
-```bash
 ./netpipe\_forwarder \[OPTIONS\]
 Options:
 \--help: Display the help message and exit.
@@ -62,14 +57,17 @@ Options:
 \-p \<port\>: Specify the port number to connect to (e.g., 80, 22, 12345). This option is required.
 
 \-v: Enable verbose output for debugging.
-```
 
-## Run Instructions & Examples
-Before running the netpipe\_forwarder, it's helpful to understand the flow:
 
-Socket to Pipe: Data received from the network socket will be written to /tmp/net\_to\_pipe.
+### Run Instructions & Examples
 
-Pipe to Socket: Data written to /tmp/pipe\_to\_net will be sent to the network socket.
+A test program, netpipe_connector has been added.
+
+Before running the netpipe_forwarder, it's helpful to understand the flow:
+
+Socket to Pipe: Data received from the network socket will be written to /tmp/net_to_pipe.
+
+Pipe to Socket: Data written to /tmp/pipe_to_net will be sent to the network socket.
 
 Example Setup (Using netcat for a simple server)
 Let's assume you want to connect to a simple TCP server running on localhost (127.0.0.1) at port 12345\.
@@ -78,7 +76,7 @@ Start a simple TCP server (in Terminal 1):
 You can use netcat (often nc) as a basic server:
 
 ```bash
-nc \-l \-p 12345
+nc -l -p 12345
 ```
 
 This netcat instance will listen on port 12345\. Anything you type here will be sent to connected clients, and anything received from clients will be displayed here.
@@ -87,30 +85,20 @@ Run the netpipe\_forwarder (in Terminal 2):
 Connect your forwarder to the netcat server:
 
 ```bash
-./netpipe\_forwarder \-h 127.0.0.1 \-p 12345 \-v
+./netpipe\_forwarder -h 127.0.0.1 -p 12345 -v
 ```
 
 You will see verbose output indicating the connection and thread creation.
 
 Interact with the Named Pipes:
 
+In, yet another terminal widow, do the following:
+```bash
+./netpipe_connector
+```
+If you now tipe into this window the text will be sent, via netpipe_forwarder, to the socket of the application.  Anything it returns will be displayed on the screen.
+
 Sending data from a named pipe to the network (Terminal 3):
 Write some text to the /tmp/pipe\_to\_net named pipe. This data will be sent to your netcat server.
 
-```Bash
-echo "Hello Netcat from Pipe\!" \> /tmp/pipe\_to\_net
-```
 
-You should immediately see "Hello Netcat from Pipe\!" appear in your Terminal 1 (netcat server).
-
-Receiving data from the network in a named pipe (Terminal 4):
-In Terminal 1 (netcat server), type some text and press Enter:
-
-(In Netcat Terminal 1):
-This is a message from the server.
-Now, in a new Terminal 4, read from the /tmp/net\_to\_pipe named pipe. You will see the message from the server.
-
-```bash
-cat /tmp/net\_to\_pipe
-```
-cat will continue to display new data as it arrives. If you only want to read the current content and exit, you can use head \-n 1 /tmp/net\_to\_pipe or similar.
